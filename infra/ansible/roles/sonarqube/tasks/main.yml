@@ -1,0 +1,169 @@
+---
+# =============================================================================
+# Ansible role: sonarqube
+#
+# Deploys SonarQube Community 9.9 LTS + PostgreSQL 15 via Docker Compose.
+# Runs on a dedicated EC2 instance (sonarqube group in inventory).
+#
+# Pre-requisites
+#   • Docker daemon (installed by this role).
+#   • vm.max_map_count ≥ 262144 (set below — required by Elasticsearch).
+#   • Port 9000 open in the sonarqube security group.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Kernel tuning — Elasticsearch embedded in SonarQube requires this
+# ---------------------------------------------------------------------------
+- name: Set vm.max_map_count for Elasticsearch
+  ansible.posix.sysctl:
+    name: vm.max_map_count
+    value: "262144"
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-sonarqube.conf
+
+- name: Set fs.file-max for SonarQube
+  ansible.posix.sysctl:
+    name: fs.file-max
+    value: "131072"
+    state: present
+    reload: true
+    sysctl_file: /etc/sysctl.d/99-sonarqube.conf
+
+# ---------------------------------------------------------------------------
+# Docker Engine — required to run SonarQube + PostgreSQL via Compose
+# (Amazon Linux 2: install via amazon-linux-extras, then enable + start)
+# ---------------------------------------------------------------------------
+- name: Enable Docker via amazon-linux-extras
+  ansible.builtin.command: amazon-linux-extras enable docker
+  changed_when: false
+
+- name: Install Docker Engine
+  ansible.builtin.yum:
+    name: docker
+    state: present
+
+- name: Enable and start Docker daemon
+  ansible.builtin.systemd:
+    name: docker
+    enabled: true
+    state: started
+
+# ---------------------------------------------------------------------------
+# Ensure Docker Compose v2 plugin is available
+# (Amazon Linux 2 ships Docker but not compose-plugin by default)
+# ---------------------------------------------------------------------------
+- name: Check Docker Compose v2 is installed
+  ansible.builtin.command: docker compose version
+  register: compose_check
+  changed_when: false
+  failed_when: false
+
+- name: Ensure Docker CLI plugins directory exists
+  ansible.builtin.file:
+    path: /usr/local/lib/docker/cli-plugins
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+  when: compose_check.rc != 0
+
+- name: Install Docker Compose v2 plugin binary
+  ansible.builtin.get_url:
+    url: "https://github.com/docker/compose/releases/download/v{{ sonarqube_compose_version }}/docker-compose-linux-x86_64"
+    dest: /usr/local/lib/docker/cli-plugins/docker-compose
+    mode: "0755"
+    owner: root
+    group: root
+  when: compose_check.rc != 0
+
+# ---------------------------------------------------------------------------
+# Directory layout
+# ---------------------------------------------------------------------------
+- name: Create SonarQube base directory
+  ansible.builtin.file:
+    path: "{{ sonarqube_base_dir }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0750"
+
+- name: Create SonarQube data sub-directories (SonarQube UID 1000)
+  ansible.builtin.file:
+    path: "{{ sonarqube_base_dir }}/{{ item }}"
+    state: directory
+    owner: "1000"    # SonarQube container runs as UID 1000
+    group: "1000"
+    mode: "0750"
+  loop:
+    - data
+    - logs
+    - extensions
+
+# PostgreSQL Alpine container runs as UID 70 (postgres user).
+# Do NOT pre-create the postgres dir as UID 1000 — the entrypoint must own it.
+# If it already exists with wrong ownership, fix it; otherwise Docker creates it.
+- name: Ensure postgres data directory is owned by PostgreSQL (UID 70)
+  ansible.builtin.file:
+    path: "{{ sonarqube_base_dir }}/postgres"
+    state: directory
+    owner: "70"     # Alpine postgres user UID
+    group: "70"
+    mode: "0750"
+
+# ---------------------------------------------------------------------------
+# Deploy Compose file
+# ---------------------------------------------------------------------------
+- name: Deploy SonarQube docker-compose.yml
+  ansible.builtin.template:
+    src: docker-compose.sonarqube.yml.j2
+    dest: "{{ sonarqube_base_dir }}/docker-compose.yml"
+    owner: root
+    group: root
+    mode: "0640"
+  notify: restart sonarqube stack
+
+# ---------------------------------------------------------------------------
+# Start / update the stack
+# (Use ansible.builtin.command rather than community.docker.docker_compose_v2
+#  to avoid the collection's Docker CLI discovery failing on Amazon Linux 2)
+# ---------------------------------------------------------------------------
+- name: Pull SonarQube and PostgreSQL images
+  ansible.builtin.command:
+    cmd: docker compose pull
+    chdir: "{{ sonarqube_base_dir }}"
+  register: sonarqube_pull
+  changed_when: "'Pull complete' in sonarqube_pull.stdout or sonarqube_pull.rc == 0"
+
+- name: Start SonarQube stack
+  ansible.builtin.command:
+    cmd: docker compose up -d --remove-orphans
+    chdir: "{{ sonarqube_base_dir }}"
+  register: sonarqube_up
+  changed_when: "'Started' in sonarqube_up.stderr or 'Created' in sonarqube_up.stderr"
+
+# ---------------------------------------------------------------------------
+# Wait for SonarQube to be ready before finishing the play
+# First boot on t3.medium can take 5–8 minutes while Elasticsearch
+# initialises. We use failed_when: false so connection errors during JVM
+# startup (ECONNRESET, ECONNREFUSED) don't abort the retry loop early.
+# ---------------------------------------------------------------------------
+- name: Wait for SonarQube web UI to become available
+  ansible.builtin.uri:
+    url: "http://localhost:{{ sonarqube_port }}/api/system/status"
+    method: GET
+    status_code: [200, 503]
+    return_content: true
+  register: sonarqube_status
+  failed_when: false
+  until: >
+    sonarqube_status.status is defined and
+    sonarqube_status.status == 200 and
+    sonarqube_status.json is defined and
+    (sonarqube_status.json.status == 'UP' or sonarqube_status.json.status == 'DB_MIGRATION_RUNNING')
+  retries: 48
+  delay: 15
+
+- name: Display SonarQube startup status
+  ansible.builtin.debug:
+    msg: "SonarQube is {{ sonarqube_status.json.status | default('UP') }} at http://{{ ansible_host }}:{{ sonarqube_port }}"
