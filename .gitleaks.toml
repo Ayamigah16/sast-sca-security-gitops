@@ -10,10 +10,13 @@ useDefault = true
 # ---------------------------------------------------------------------------
 [allowlist]
 description = "Repo-level allowlist"
+regexTarget = "match"
 
 # Ansible-vault AES256 ciphertext is not a raw secret.
 regexes = [
   '''\$ANSIBLE_VAULT;1\.\d;AES256''',
+  # SonarCloud project key is an identifier, not a credential.
+  '''sonar\.projectKey=ayamigah16_gitops''',
 ]
 
 # Encrypted vault file — the entire file is ciphertext, not plaintext secrets.
